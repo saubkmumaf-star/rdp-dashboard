@@ -1,0 +1,61 @@
+# Snippet only: paste this step into the target repository workflow after RDP/Tailscale values exist.
+# See ../README-RUNNER-LIVE-TELEMETRY.md for secret setup and variable mapping.
+      - name: Publish live runner details to dashboard
+        shell: pwsh
+        env:
+          DASHBOARD_URL: https://rdp-dashboard-jet.vercel.app
+          RUNNER_INGEST_TOKEN: ${{ secrets.RUNNER_INGEST_TOKEN }}
+          VERCEL_PROTECTION_BYPASS: ${{ secrets.VERCEL_PROTECTION_BYPASS }}
+          RDP_ADDRESS: ${{ env.RDP_ADDRESS }}
+          RDP_USERNAME: ${{ env.RDP_USERNAME }}
+          RDP_PASSWORD: ${{ env.RDP_PASSWORD }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ([string]::IsNullOrWhiteSpace($env:RUNNER_INGEST_TOKEN)) { throw 'RUNNER_INGEST_TOKEN GitHub Actions secret is missing.' }
+          if ([string]::IsNullOrWhiteSpace($env:GITHUB_REPOSITORY) -or [string]::IsNullOrWhiteSpace($env:GITHUB_RUN_ID)) { throw 'GitHub run metadata is missing.' }
+
+          $cpuInfo = @(Get-CimInstance Win32_Processor)
+          $cpu = ($cpuInfo | Select-Object -First 1 -ExpandProperty Name)
+          $cores = ($cpuInfo | Measure-Object -Property NumberOfCores -Sum).Sum
+          $threads = ($cpuInfo | Measure-Object -Property NumberOfLogicalProcessors -Sum).Sum
+          $computer = Get-CimInstance Win32_ComputerSystem
+          $ram = '{0:N2} GB' -f ($computer.TotalPhysicalMemory / 1GB)
+          $diskInfo = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='C:'"
+          $disk = if ($diskInfo) { '{0:N1} GB total, {1:N1} GB free' -f ($diskInfo.Size / 1GB), ($diskInfo.FreeSpace / 1GB) } else { '' }
+          $osInfo = Get-CimInstance Win32_OperatingSystem
+          $os = if ($osInfo) { "$($osInfo.Caption) ($($osInfo.Version))" } else { 'Windows' }
+
+          $address = $env:RDP_ADDRESS
+          if ([string]::IsNullOrWhiteSpace($address)) {
+            $ts = Get-Command tailscale -ErrorAction SilentlyContinue
+            if ($ts) { $address = (& $ts.Source ip -4 2>$null | Select-Object -First 1) }
+          }
+          $username = $env:RDP_USERNAME
+          $password = $env:RDP_PASSWORD
+          $aliveLine = if (-not [string]::IsNullOrWhiteSpace($address)) { "alive — RDP: $address" } else { '' }
+          $payload = @{
+            action = 'ingest'
+            repo = $env:GITHUB_REPOSITORY
+            runId = [long]$env:GITHUB_RUN_ID
+            runNumber = [long]$env:GITHUB_RUN_NUMBER
+            branch = $env:GITHUB_REF_NAME
+            status = 'in_progress'
+            details = @{
+              cpu = $cpu
+              cores = "$cores cores / $threads threads"
+              ram = $ram
+              disk = $disk
+              os = $os
+              address = $address
+              username = $username
+              password = $password
+              aliveLine = $aliveLine
+            }
+            recentLines = @()
+          } | ConvertTo-Json -Depth 6 -Compress
+          $headers = @{ Authorization = "Bearer $env:RUNNER_INGEST_TOKEN" }
+          # Needed only when the Vercel deployment is protected by Vercel Authentication.
+          if (-not [string]::IsNullOrWhiteSpace($env:VERCEL_PROTECTION_BYPASS)) { $headers['x-vercel-protection-bypass'] = $env:VERCEL_PROTECTION_BYPASS }
+          $result = Invoke-RestMethod -Method Post -Uri "$($env:DASHBOARD_URL.TrimEnd('/'))/api/runner-live" -Headers $headers -ContentType 'application/json' -Body $payload -TimeoutSec 15
+          if ($result.ok -ne $true -or $result.stored -ne $true) { throw 'Dashboard did not confirm that telemetry was saved. Check Vercel protection bypass and server logs.' }
+          Write-Host 'Live runner telemetry published to dashboard (credential values omitted).'

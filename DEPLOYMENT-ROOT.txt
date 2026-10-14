@@ -1,0 +1,10 @@
+Deploy the contents of this ZIP as the Vercel project root.
+
+The ROOT must contain index.html, package.json, vercel.json, api/ and lib/ together.
+Do not upload the JavaScript files inside api/ or lib/ as root-level files.
+
+Required routes: api/config.js, api/health.js, api/running-runs.js, api/run-log.js, api/tailscale.js.
+Required helpers: lib/api-helpers.js, lib/runner-log-parser.js.
+
+Set Vercel Root Directory to this exact folder, commit, and redeploy Production.
+Then test /api/health. A Vercel HTML 404 means the route files/folder were not deployed at the selected root.

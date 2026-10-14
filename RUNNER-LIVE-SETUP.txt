@@ -1,0 +1,14 @@
+LIVE RUNNER DETAILS QUICK SETUP
+
+To load CPU/RAM/OS/RDP details during an active GitHub Actions run, the target workflow must send live telemetry; GitHub's run/job log download APIs often return 404 until logs become available. See README-RUNNER-LIVE-TELEMETRY.md for the exact PowerShell step.
+
+Vercel Production Environment Variables:
+- TURSO_DATABASE_URL
+- TURSO_AUTH_TOKEN
+- RUNNER_INGEST_TOKEN (new random secret, required for live telemetry only)
+
+Target GitHub repository Actions secrets:
+- RUNNER_INGEST_TOKEN (same value as Vercel)
+- VERCEL_PROTECTION_BYPASS (only if Vercel Deployment Protection is enabled; generate in Vercel Protection Bypass for Automation)
+
+Map the workflow's actual RDP address/user/password variables into RDP_ADDRESS, RDP_USERNAME, and RDP_PASSWORD. Never echo token/password in the workflow log. After editing the target workflow, start a NEW workflow run; existing runs cannot retroactively publish telemetry.

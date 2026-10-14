@@ -1,0 +1,15 @@
+{
+  "name": "github-actions-tailscale-runner-dashboard",
+  "version": "1.3.0",
+  "private": true,
+  "description": "Multi-repository GitHub Actions dashboard with Turso sync, Tailscale approval, runner live telemetry, and secure live runner cards",
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "jszip": "^3.10.1"
+  },
+  "scripts": {
+    "test": "node --test"
+  }
+}
