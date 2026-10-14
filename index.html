@@ -1620,6 +1620,65 @@
       });
     }
 
+    function decodeBase64Utf8(base64) {
+      try {
+        const binString = atob(String(base64 || '').replace(/\s/g, ''));
+        const bytes = Uint8Array.from(binString, m => m.charCodeAt(0));
+        return new TextDecoder().decode(bytes);
+      } catch (_) {
+        try { return atob(String(base64 || '').replace(/\s/g, '')); } catch (_) { return ''; }
+      }
+    }
+
+    async function fetchDirectGitHubStatus(row) {
+      const token = state.tokens[row.repo.tokenId]?.token;
+      if (!token) return null;
+      const headers = {
+        'Accept': 'application/vnd.github+json',
+        'Authorization': `Bearer ${token}`,
+        'X-GitHub-Api-Version': '2022-11-28'
+      };
+      const runId = Number(row.run.id);
+      const paths = [`rdp-status/${runId}.json`, 'rdp-status.json'];
+      for (const p of paths) {
+        try {
+          const res = await fetch(`https://api.github.com/repos/${row.repoSlug}/contents/${p}`, { headers, cache: 'no-store' });
+          if (!res.ok) continue;
+          const data = await res.json();
+          if (!data || !data.content) continue;
+          const raw = decodeBase64Utf8(data.content);
+          const parsed = JSON.parse(raw);
+          if (!parsed || typeof parsed !== 'object') continue;
+          if (p === 'rdp-status.json' && parsed.runId && String(parsed.runId) !== String(runId)) continue;
+          const minLeft = typeof parsed.restartingIn === 'number' ? parsed.restartingIn : '?';
+          const aliveAt = parsed.aliveAt || parsed.updatedAt || '';
+          const timeStr = aliveAt ? new Date(aliveAt).toISOString().slice(11, 19) : '';
+          return {
+            details: {
+              cpu: String(parsed.cpu || ''),
+              cores: String(parsed.cores || ''),
+              ram: String(parsed.ram || ''),
+              disk: String(parsed.disk || ''),
+              os: String(parsed.os || ''),
+              address: String(parsed.address || ''),
+              username: String(parsed.username || ''),
+              password: String(parsed.password || ''),
+              aliveLine: timeStr ? `[${timeStr}] alive — RDP: ${parsed.address || 'N/A'} | restarting in ${minLeft} min` : (parsed.address ? `alive — RDP: ${parsed.address}` : '')
+            },
+            recentLines: [
+              `[rdp-status] Status: ${parsed.status || 'running'} · Run #${parsed.runNumber || runId}`,
+              `[rdp-status] Host: ${parsed.os || 'Windows'} · CPU: ${parsed.cpu || 'N/A'} (${parsed.cores || ''}) · RAM: ${parsed.ram || 'N/A'}`,
+              `[rdp-status] Disk: ${parsed.disk || 'N/A'}`,
+              `[rdp-status] Session: Address ${parsed.address || 'N/A'} · Username: ${parsed.username || 'RDP'}`,
+              `[rdp-status] Last keep-alive: ${parsed.updatedAt || ''} · Auto-restart in ${minLeft} min`
+            ],
+            updatedAt: new Date(parsed.updatedAt || Date.now()).getTime()
+          };
+        } catch (_) {}
+      }
+      return null;
+    }
+
     async function fetchRunnerLog(row) {
       const key = runnerKey(row);
       const previous = runnerLogCache.get(key);
@@ -1628,9 +1687,9 @@
       let liveMessage = '';
       try {
         // Active GitHub workflow logs are often not downloadable through the REST API.
-        // Prefer telemetry explicitly published by the workflow into the shared live table.
+        // Prefer telemetry explicitly published by the workflow into the shared live table or rdp-status.
         const live = await runnerApiFetch('/api/runner-live', row.repo, { action: 'read', repo: row.repoSlug, runId: Number(row.run.id) });
-        if (live.found && live.details) {
+        if (live.found && live.details && (live.details.address || live.details.cpu)) {
           runnerLogCache.set(key, { loading: false, updatedAt: Number(live.updatedAt) || Date.now(), details: live.details, recentLines: live.recentLines || [], source: live.source || 'live-telemetry', error: '' });
           renderRunningRunnerCards();
           return;
@@ -1642,7 +1701,11 @@
       }
       try {
         const data = await runnerApiFetch('/api/run-log', row.repo, { repo: row.repoSlug, runId: Number(row.run.id) });
-        runnerLogCache.set(key, { loading: false, updatedAt: Date.now(), details: data.details || {}, recentLines: data.recentLines || [], source: data.source || 'github-logs', error: '' });
+        if (data.details && (data.details.address || data.details.cpu)) {
+          runnerLogCache.set(key, { loading: false, updatedAt: Date.now(), details: data.details || {}, recentLines: data.recentLines || [], source: data.source || 'github-logs', error: '' });
+          renderRunningRunnerCards();
+          return;
+        }
       } catch (error) {
         let message = error.message;
         if (error.code === 'RUN_LOGS_NOT_READY' || error.status === 409) {
@@ -1652,6 +1715,17 @@
         }
         runnerLogCache.set(key, { ...(previous || {}), loading: false, updatedAt: Date.now(), error: message });
       }
+
+      // Direct client-side GitHub fallback: fetch rdp-status/{runId}.json or rdp-status.json
+      try {
+        const direct = await fetchDirectGitHubStatus(row);
+        if (direct && direct.details && (direct.details.address || direct.details.cpu)) {
+          runnerLogCache.set(key, { loading: false, updatedAt: direct.updatedAt || Date.now(), details: direct.details, recentLines: direct.recentLines || [], source: 'rdp-status-direct', error: '' });
+          renderRunningRunnerCards();
+          return;
+        }
+      } catch (_) {}
+
       renderRunningRunnerCards();
     }
 

@@ -104,6 +104,37 @@ function cellValue(cell) {
   return Object.prototype.hasOwnProperty.call(cell, 'value') ? cell.value : null;
 }
 
+async function fetchRdpStatusFile(repo, runId, githubToken) {
+  const paths = [`rdp-status/${runId}.json`, 'rdp-status.json'];
+  for (const path of paths) {
+    try {
+      const response = await fetch(`https://api.github.com/repos/${repo}/contents/${path}`, {
+        headers: {
+          Accept: 'application/vnd.github+json',
+          Authorization: `Bearer ${githubToken}`,
+          'X-GitHub-Api-Version': '2022-11-28',
+          'User-Agent': 'actions-tailscale-dashboard'
+        },
+        cache: 'no-store',
+        signal: AbortSignal.timeout(8000)
+      });
+      if (!response || !response.ok) continue;
+      const data = await response.json();
+      if (!data || !data.content) continue;
+      const raw = Buffer.from(String(data.content).replace(/\s/g, ''), 'base64').toString('utf8');
+      const status = JSON.parse(raw);
+      if (!status || typeof status !== 'object') continue;
+      if (path === 'rdp-status.json' && status.runId && String(status.runId) !== String(runId)) {
+        continue;
+      }
+      return status;
+    } catch (_) {
+      // Ignore network errors or 404
+    }
+  }
+  return null;
+}
+
 module.exports = async function handler(req, res) {
   noStore(res);
   if (req.method !== 'POST') {
@@ -168,21 +199,63 @@ module.exports = async function handler(req, res) {
       return sendJson(res, 403, { code: 'RUN_REPOSITORY_MISMATCH', message: 'GitHub run does not match the requested repository.' });
     }
 
-    await ensureTable();
-    const result = await tursoExecute(`SELECT payload, updated_at FROM ${TABLE} WHERE k = ?`, [arg('text', key)]);
-    const row = result.rows?.[0];
-    if (!Array.isArray(row)) {
-      return sendJson(res, 200, { found: false, details: {}, recentLines: [], message: 'No live telemetry has been published by this workflow yet. Add the runner telemetry step described in README-RUNNER-LIVE-TELEMETRY.md.' });
+    let row = null;
+    try {
+      await ensureTable();
+      const result = await tursoExecute(`SELECT payload, updated_at FROM ${TABLE} WHERE k = ?`, [arg('text', key)]);
+      row = result.rows?.[0];
+    } catch (_) {
+      // Turso table may not be initialized yet; fallback to rdp-status file
     }
-    const payloadText = cellValue(row[0]);
-    const updatedAt = Number(cellValue(row[1])) || 0;
-    if (!payloadText || !updatedAt || Date.now() - updatedAt > MAX_AGE_MS) {
-      return sendJson(res, 200, { found: false, details: {}, recentLines: [], updatedAt, message: 'Live telemetry is missing or expired. Publish a fresh status from the workflow.' });
+
+    if (Array.isArray(row)) {
+      const payloadText = cellValue(row[0]);
+      const updatedAt = Number(cellValue(row[1])) || 0;
+      if (payloadText && updatedAt && Date.now() - updatedAt <= MAX_AGE_MS) {
+        let payload;
+        try { payload = JSON.parse(String(payloadText)); }
+        catch (_) { payload = {}; }
+        return sendJson(res, 200, { found: true, source: 'live-telemetry', details: safeDetails(payload.details), recentLines: cleanRecentLines(payload.recentLines), runNumber: payload.runNumber || null, branch: payload.branch || '', status: payload.status || run.status || '', updatedAt });
+      }
     }
-    let payload;
-    try { payload = JSON.parse(String(payloadText)); }
-    catch (_) { payload = {}; }
-    return sendJson(res, 200, { found: true, source: 'live-telemetry', details: safeDetails(payload.details), recentLines: cleanRecentLines(payload.recentLines), runNumber: payload.runNumber || null, branch: payload.branch || '', status: payload.status || run.status || '', updatedAt });
+
+    // Fallback: check rdp-status/<runId>.json and rdp-status.json from GitHub repository
+    const statusFile = await fetchRdpStatusFile(repo, runId, githubToken);
+    if (statusFile && (statusFile.address || statusFile.cpu || statusFile.status)) {
+      const minLeft = typeof statusFile.restartingIn === 'number' ? statusFile.restartingIn : '?';
+      const aliveAt = statusFile.aliveAt || statusFile.updatedAt || '';
+      const timeStr = aliveAt ? new Date(aliveAt).toISOString().slice(11, 19) : '';
+      const details = safeDetails({
+        cpu: statusFile.cpu,
+        cores: statusFile.cores,
+        ram: statusFile.ram,
+        disk: statusFile.disk,
+        os: statusFile.os,
+        address: statusFile.address,
+        username: statusFile.username,
+        password: statusFile.password,
+        aliveLine: timeStr ? `[${timeStr}] alive — RDP: ${statusFile.address || 'N/A'} | restarting in ${minLeft} min` : (statusFile.address ? `alive — RDP: ${statusFile.address}` : '')
+      });
+      const recentLines = cleanRecentLines([
+        `[rdp-status] Status: ${statusFile.status || 'running'} · Run #${statusFile.runNumber || runId}`,
+        `[rdp-status] Host: ${statusFile.os || 'Windows'} · CPU: ${statusFile.cpu || 'N/A'} (${statusFile.cores || ''}) · RAM: ${statusFile.ram || 'N/A'}`,
+        `[rdp-status] Disk: ${statusFile.disk || 'N/A'}`,
+        `[rdp-status] Session: Address ${statusFile.address || 'N/A'} · Username: ${statusFile.username || 'RDP'}`,
+        `[rdp-status] Last keep-alive: ${statusFile.updatedAt || ''} · Auto-restart in ${minLeft} min`
+      ]);
+      return sendJson(res, 200, {
+        found: true,
+        source: 'rdp-status-file',
+        details,
+        recentLines,
+        runNumber: Number(statusFile.runNumber) || null,
+        branch: '',
+        status: statusFile.status || run.status || '',
+        updatedAt: new Date(statusFile.updatedAt || Date.now()).getTime()
+      });
+    }
+
+    return sendJson(res, 200, { found: false, details: {}, recentLines: [], message: 'No live telemetry has been published by this workflow yet. Add the runner telemetry step described in README-RUNNER-LIVE-TELEMETRY.md.' });
   } catch (error) {
     let message = publicErrorMessage(error);
     if (/Runner telemetry authentication failed/.test(error.message || '')) message = error.message;

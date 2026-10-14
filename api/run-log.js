@@ -112,6 +112,32 @@ async function getIndividualJobLogs(repo, runId, token) {
   return combined.trim() ? { ok: true, text: combined, source: 'job-logs' } : { ok: false, status: 404 };
 }
 
+async function fetchRdpStatusFile(repo, runId, token) {
+  const paths = [`rdp-status/${runId}.json`, 'rdp-status.json'];
+  for (const path of paths) {
+    try {
+      const response = await fetch(`${GH}/repos/${repo}/contents/${path}`, {
+        headers: githubHeaders(token),
+        cache: 'no-store',
+        signal: AbortSignal.timeout(8000)
+      });
+      if (!response || !response.ok) continue;
+      const data = await response.json();
+      if (!data || !data.content) continue;
+      const raw = Buffer.from(String(data.content).replace(/\s/g, ''), 'base64').toString('utf8');
+      const status = JSON.parse(raw);
+      if (!status || typeof status !== 'object') continue;
+      if (path === 'rdp-status.json' && status.runId && String(status.runId) !== String(runId)) {
+        continue;
+      }
+      return status;
+    } catch (_) {
+      // Ignore 404 or missing mocked route in tests
+    }
+  }
+  return null;
+}
+
 module.exports = async function handler(req, res) {
   if (!requireMethod(req, res, 'POST')) return;
   const token = getBearerToken(req);
@@ -121,6 +147,38 @@ module.exports = async function handler(req, res) {
     const repo = parseRepoSlug(body.repo);
     const runId = Number(body.runId);
     if (!Number.isSafeInteger(runId) || runId <= 0) return sendJson(res, 400, { code: 'INVALID_RUN_ID', message: 'runId must be a positive integer.' });
+
+    // 1. Check for live rdp-status file committed to the repository by the workflow
+    const statusFile = await fetchRdpStatusFile(repo, runId, token);
+    if (statusFile && (statusFile.address || statusFile.cpu || statusFile.status)) {
+      const minLeft = typeof statusFile.restartingIn === 'number' ? statusFile.restartingIn : '?';
+      const aliveAt = statusFile.aliveAt || statusFile.updatedAt || '';
+      const timeStr = aliveAt ? new Date(aliveAt).toISOString().slice(11, 19) : '';
+      const aliveLine = timeStr
+        ? `[${timeStr}] alive — RDP: ${statusFile.address || 'N/A'} | restarting in ${minLeft} min`
+        : (statusFile.address ? `alive — RDP: ${statusFile.address}` : '');
+      return sendJson(res, 200, {
+        details: {
+          cpu: String(statusFile.cpu || ''),
+          cores: String(statusFile.cores || ''),
+          ram: String(statusFile.ram || ''),
+          disk: String(statusFile.disk || ''),
+          os: String(statusFile.os || ''),
+          address: String(statusFile.address || ''),
+          username: String(statusFile.username || ''),
+          password: String(statusFile.password || ''),
+          aliveLine
+        },
+        recentLines: [
+          `[rdp-status] Status: ${statusFile.status || 'running'} · Run #${statusFile.runNumber || runId}`,
+          `[rdp-status] Host: ${statusFile.os || 'Windows'} · CPU: ${statusFile.cpu || 'N/A'} (${statusFile.cores || ''}) · RAM: ${statusFile.ram || 'N/A'}`,
+          `[rdp-status] Disk: ${statusFile.disk || 'N/A'}`,
+          `[rdp-status] Session: Address ${statusFile.address || 'N/A'} · Username: ${statusFile.username || 'RDP'}`,
+          `[rdp-status] Last keep-alive: ${statusFile.updatedAt || ''} · Auto-restart in ${minLeft} min`
+        ],
+        source: 'rdp-status-file'
+      });
+    }
 
     let logResult;
     let archiveError = null;

@@ -195,3 +195,85 @@ test('run-log explains that active GitHub workflow logs are unavailable until li
     global.fetch = oldFetch;
   }
 });
+
+test('run-log loads live RDP details from rdp-status/{runId}.json file in the repository', async () => {
+  const runLog = require('../api/run-log');
+  const oldFetch = global.fetch;
+  const mockStatus = {
+    runId: '99',
+    runNumber: '5',
+    status: 'running',
+    address: '100.91.184.108',
+    username: 'RDP',
+    password: 'rakib123',
+    cpu: 'Intel Xeon Platinum',
+    cores: '2 cores / 4 threads',
+    ram: '16 GB',
+    disk: '150 GB total',
+    os: 'Windows Server 2025',
+    updatedAt: '2026-10-14T14:46:45Z',
+    restartingIn: 290
+  };
+  const b64 = Buffer.from(JSON.stringify(mockStatus)).toString('base64');
+  global.fetch = async (url) => {
+    const value = String(url);
+    if (value.includes('/contents/rdp-status/99.json')) {
+      return new Response(JSON.stringify({ content: b64 }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    throw new Error(`Unexpected URL: ${value}`);
+  };
+  try {
+    const res = responseRecorder();
+    await runLog({ method: 'POST', headers: { authorization: 'Bearer test-token' }, body: { repo: 'safwasf/rdpv1', runId: 99 } }, res);
+    assert.equal(res.statusCode, 200);
+    const body = JSON.parse(res.body);
+    assert.equal(body.source, 'rdp-status-file');
+    assert.equal(body.details.address, '100.91.184.108');
+    assert.equal(body.details.username, 'RDP');
+    assert.equal(body.details.password, 'rakib123');
+    assert.equal(body.details.cpu, 'Intel Xeon Platinum');
+    assert.match(body.details.aliveLine, /100\.91\.184\.108/);
+  } finally {
+    global.fetch = oldFetch;
+  }
+});
+
+test('runner-live read falls back to rdp-status/{runId}.json when Turso is not populated', async () => {
+  const runnerLive = require('../api/runner-live');
+  const oldFetch = global.fetch;
+  const mockStatus = {
+    runId: '101',
+    status: 'running',
+    address: '100.64.0.1',
+    username: 'RDP',
+    password: 'secretPassword',
+    cpu: 'AMD EPYC',
+    updatedAt: '2026-10-14T15:00:00Z'
+  };
+  const b64 = Buffer.from(JSON.stringify(mockStatus)).toString('base64');
+  global.fetch = async (url) => {
+    const value = String(url);
+    if (value.endsWith('/actions/runs/101')) {
+      return new Response(JSON.stringify({ id: 101, status: 'in_progress', repository: { full_name: 'test/repo' } }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    if (value.includes('/contents/rdp-status/101.json')) {
+      return new Response(JSON.stringify({ content: b64 }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    throw new Error(`Unexpected URL: ${value}`);
+  };
+  try {
+    const res = responseRecorder();
+    await runnerLive({ method: 'POST', headers: { authorization: 'Bearer test-token' }, body: { action: 'read', repo: 'test/repo', runId: 101 } }, res);
+    assert.equal(res.statusCode, 200);
+    const body = JSON.parse(res.body);
+    assert.equal(body.found, true);
+    assert.equal(body.source, 'rdp-status-file');
+    assert.equal(body.details.address, '100.64.0.1');
+    assert.equal(body.details.username, 'RDP');
+    assert.equal(body.details.password, 'secretPassword');
+    assert.equal(body.details.cpu, 'AMD EPYC');
+  } finally {
+    global.fetch = oldFetch;
+  }
+});
+
